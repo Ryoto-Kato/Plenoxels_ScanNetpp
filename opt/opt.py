@@ -29,7 +29,10 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from typing import NamedTuple, Optional, Union
 
+from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+
 device = "cuda" if torch.cuda.is_available() else "cpu"
+LPIPS = LearnedPerceptualImagePatchSimilarity(net_type='vgg', normalize = True).to(device)
 
 parser = argparse.ArgumentParser()
 config_util.define_common_args(parser)
@@ -38,6 +41,8 @@ config_util.define_common_args(parser)
 group = parser.add_argument_group("general")
 group.add_argument('--train_dir', '-t', type=str, default='ckpt',
                      help='checkpoint and logging directory')
+
+
 
 group.add_argument('--reso',
                         type=str,
@@ -244,6 +249,12 @@ group.add_argument('--n_train', type=int, default=None, help='Number of training
 group.add_argument('--nosphereinit', action='store_true', default=False,
                      help='do not start with sphere bounds (please do not use for 360)')
 
+# NSVF
+group.add_argument('--pre_centralized_normalized', type = bool, default=True)
+
+# scene name
+group.add_argument('--scene_name', type = str, default="sample1")
+
 args = parser.parse_args()
 config_util.maybe_merge_config_file(args)
 
@@ -266,6 +277,8 @@ torch.manual_seed(20200823)
 np.random.seed(20200823)
 
 factor = 1
+# Detect the data format
+# transforms.json-> NeRF (Blender) dataset -> dataset_type NeRFDataset
 dset = datasets[args.dataset_type](
                args.data_dir,
                split="train",
@@ -278,9 +291,11 @@ if args.background_nlayers > 0 and not dset.should_use_background:
     warn('Using a background model for dataset type ' + str(type(dset)) + ' which typically does not use background')
 
 dset_test = datasets[args.dataset_type](
-        args.data_dir, split="test", **config_util.build_data_options(args))
+        args.data_dir, split="test", device = device, **config_util.build_data_options(args))
 
 global_start_time = datetime.now()
+
+print(dset.scene_radius)
 
 grid = svox2.SparseGrid(reso=reso_list[reso_id],
                         center=dset.scene_center,
@@ -345,6 +360,15 @@ resample_cameras = [
                      ndc_coeffs=dset.ndc_coeffs) for i, c2w in enumerate(dset.c2w)
     ]
 ckpt_path = path.join(args.train_dir, 'ckpt.npz')
+scene_name = args.scene_name
+print(f"scene_name: {scene_name}")
+submission_path = path.join(args.train_dir, os.pardir, "submission")
+if not os.path.exists(submission_path):
+    os.makedirs(submission_path, exist_ok=True)
+
+sub_scene_path = path.join(submission_path, scene_name)
+if not os.path.exists(sub_scene_path):
+    os.makedirs(sub_scene_path, exist_ok=True)
 
 lr_sigma_func = get_expon_lr_func(args.lr_sigma, args.lr_sigma_final, args.lr_sigma_delay_steps,
                                   args.lr_sigma_delay_mult, args.lr_sigma_decay_steps)
@@ -376,10 +400,11 @@ while True:
         # Put in a function to avoid memory leak
         print('Eval step')
         with torch.no_grad():
-            stats_test = {'psnr' : 0.0, 'mse' : 0.0}
+            stats_test = {'psnr' : 0.0, 'mse' : 0.0, 'lpips': 0.0}
 
             # Standard set
-            N_IMGS_TO_EVAL = min(20 if epoch_id > 0 else 5, dset_test.n_images)
+            # N_IMGS_TO_EVAL = min(20 if epoch_id > 0 else 5, dset_test.n_images)
+            N_IMGS_TO_EVAL = dset_test.n_images
             N_IMGS_TO_SAVE = N_IMGS_TO_EVAL # if not args.tune_mode else 1
             img_eval_interval = dset_test.n_images // N_IMGS_TO_EVAL
             img_save_interval = (N_IMGS_TO_EVAL // N_IMGS_TO_SAVE)
@@ -406,11 +431,30 @@ while True:
                 rgb_pred_test = grid.volume_render_image(cam, use_kernel=True)
                 rgb_gt_test = dset_test.gt[img_id].to(device=device)
                 all_mses = ((rgb_gt_test - rgb_pred_test) ** 2).cpu()
+
+                # shape of image: h, w, 3
+                # print(f"pred: {rgb_pred_test.shape}")
+                # print(f"gt: {rgb_gt_test.shape}")
+                # shape should be: B, 3, h, w
+                # print(rgb_gt_test.permute(2, 0, 1).clamp_max_(1.0)[None, :].shape)
+                lpips = LPIPS(rgb_gt_test.permute(2, 0, 1).clamp_max_(1.0)[None, :], rgb_pred_test.permute(2, 0, 1).clamp_max_(1.0)[None, :])           
+
                 if i % img_save_interval == 0:
+                    img_gt = rgb_gt_test.cpu()
+                    img_gt.clamp_max_(1.0)
+                    summary_writer.add_image(f'test/image_{img_id:04d}_gt',
+                            img_gt, global_step=gstep_id_base, dataformats='HWC')
+                    
                     img_pred = rgb_pred_test.cpu()
                     img_pred.clamp_max_(1.0)
                     summary_writer.add_image(f'test/image_{img_id:04d}',
                             img_pred, global_step=gstep_id_base, dataformats='HWC')
+
+                    im_pred_savepath = os.path.join(sub_scene_path, dset_test.camera_names[img_id]+'.png')
+                    np_im_pred = np.uint8(img_pred.numpy()*255)
+                    print(np_im_pred.shape)
+                    imageio.imwrite(uri=im_pred_savepath, im=np_im_pred)
+                    print(f"save name: {dset_test.camera_names[img_id]}")
                     if args.log_mse_image:
                         mse_img = all_mses / all_mses.max()
                         summary_writer.add_image(f'test/mse_map_{img_id:04d}',
@@ -433,6 +477,8 @@ while True:
                     assert False
                 stats_test['mse'] += mse_num
                 stats_test['psnr'] += psnr
+                _lpips = lpips.detach().cpu().numpy() + 0
+                stats_test['lpips'] += _lpips
                 n_images_gen += 1
 
             if grid.basis_type == svox2.BASIS_TYPE_3D_TEXTURE or \
@@ -461,6 +507,8 @@ while True:
 
             stats_test['mse'] /= n_images_gen
             stats_test['psnr'] /= n_images_gen
+            stats_test['lpips'] /= n_images_gen
+
             for stat_name in stats_test:
                 summary_writer.add_scalar('test/' + stat_name,
                         stats_test[stat_name], global_step=gstep_id_base)
@@ -474,7 +522,7 @@ while True:
     def train_step():
         print('Train step')
         pbar = tqdm(enumerate(range(0, epoch_size, args.batch_size)), total=batches_per_epoch)
-        stats = {"mse" : 0.0, "psnr" : 0.0, "invsqr_mse" : 0.0}
+        stats = {"mse" : 0.0, "psnr" : 0.0, "invsqr_mse" : 0.0, "lpips": 0.0}
         for iter_id, batch_begin in pbar:
             gstep_id = iter_id + gstep_id_base
             if args.lr_fg_begin_step > 0 and gstep_id == args.lr_fg_begin_step:
@@ -490,9 +538,10 @@ while True:
                 lr_basis = args.lr_basis * lr_basis_factor
 
             batch_end = min(batch_begin + args.batch_size, epoch_size)
-            batch_origins = dset.rays.origins[batch_begin: batch_end]
-            batch_dirs = dset.rays.dirs[batch_begin: batch_end]
-            rgb_gt = dset.rays.gt[batch_begin: batch_end]
+            batch_origins = dset.rays.origins[batch_begin: batch_end].to(device)
+            batch_dirs = dset.rays.dirs[batch_begin: batch_end].to(device)
+            rgb_gt = dset.rays.gt[batch_begin: batch_end].to(device)
+
             rays = svox2.Rays(batch_origins, batch_dirs)
 
             #  with Timing("volrend_fused"):
@@ -500,13 +549,14 @@ while True:
                     beta_loss=args.lambda_beta,
                     sparsity_loss=args.lambda_sparsity,
                     randomize=args.enable_random)
-
+                        
             #  with Timing("loss_comp"):
             mse = F.mse_loss(rgb_gt, rgb_pred)
 
             # Stats
             mse_num : float = mse.detach().item()
             psnr = -10.0 * math.log10(mse_num)
+
             stats['mse'] += mse_num
             stats['psnr'] += psnr
             stats['invsqr_mse'] += 1.0 / mse_num ** 2
@@ -530,6 +580,8 @@ while True:
                 #      tv_basis = grid.tv_basis() #  summary_writer.add_scalar("loss_tv_basis", tv_basis, global_step=gstep_id)
                 summary_writer.add_scalar("lr_sh", lr_sh, global_step=gstep_id)
                 summary_writer.add_scalar("lr_sigma", lr_sigma, global_step=gstep_id)
+                summary_writer.add_scalar("lambda_tv", args.lambda_tv, global_step = gstep_id)
+                summary_writer.add_scalar("lambda_tv_sh", args.lambda_tv_sh, global_step = gstep_id)
                 if grid.basis_type == svox2.BASIS_TYPE_3D_TEXTURE:
                     summary_writer.add_scalar("lr_basis", lr_basis, global_step=gstep_id)
                 if grid.use_background:
@@ -624,6 +676,12 @@ while True:
             elif args.tv_decay != 1.0:
                 args.lambda_tv *= args.tv_decay
                 args.lambda_tv_sh *= args.tv_decay
+            
+            # if args.tv_decay != 1.0:
+            #       args.lambda_tv *= args.tv_decay
+            #       args.lambda_tv_sh *= args.tv_decay
+            print(f"lambda_tv: {args.lambda_tv}")
+            print(f"tv_decay: {args.tv_decay}")
 
             reso_id += 1
             use_sparsify = True

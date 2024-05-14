@@ -44,7 +44,8 @@ class NSVFDataset(DatasetBase):
         normalize_by_bbox: bool = False,
         data_bbox_scale : float = 1.1,                    # Only used if normalize_by_bbox
         cam_scale_factor : float = 0.95,
-        normalize_by_camera: bool = True,
+        normalize_by_camera: bool = False,
+        pre_centralized_normalized: bool = True,
         **kwargs
     ):
         super().__init__()
@@ -121,10 +122,17 @@ class NSVFDataset(DatasetBase):
         full_size = [0, 0]
         rsz_h = rsz_w = 0
 
+        self.camera_names = {}
+        camera_id = 0
+
         for img_fname in tqdm(img_files):
             img_path = path.join(root, img_dir_name, img_fname)
             image = imageio.imread(img_path)
             pose_fname = path.splitext(img_fname)[0] + ".txt"
+            # print(pose_fname)
+            current_camera_name = pose_fname[2:-4]
+            self.camera_names[camera_id] = current_camera_name
+            # print(current_camera_name)
             pose_path = path.join(root, pose_dir_name, pose_fname)
             #  intrin_path = path.join(root, intrin_dir_name, pose_fname)
 
@@ -139,6 +147,7 @@ class NSVFDataset(DatasetBase):
                 image = cv2.resize(image, (rsz_w, rsz_h), interpolation=cv2.INTER_AREA)
 
             all_gt.append(torch.from_numpy(image))
+            camera_id = camera_id +1
 
 
         self.c2w_f64 = torch.stack(all_c2w)
@@ -169,11 +178,13 @@ class NSVFDataset(DatasetBase):
             self.c2w_f64 = torch.from_numpy(T) @ self.c2w_f64
             scene_scale = cam_scale_factor * sscale
 
-            #  center = np.mean(norm_poses[:, :3, 3], axis=0)
+            #  center = np.mean(norm_pofull_sizeses[:, :3, 3], axis=0)
             #  radius = np.median(np.linalg.norm(norm_poses[:, :3, 3] - center, axis=-1))
             #  self.c2w_f64[:, :3, 3] -= center
             #  scene_scale = cam_scale_factor / radius
             #  print('good', self.c2w_f64[:2], scene_scale)
+        elif pre_centralized_normalized:
+            scene_scale = 1.0
 
         print('scene_scale', scene_scale)
         self.c2w_f64[:, :3, 3] *= scene_scale
